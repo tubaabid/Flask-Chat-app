@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>ChatSecure</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body class="bg-gray-100 h-screen flex flex-col items-center justify-center">
+
+  <!-- Join Form -->
+  <div id="joinArea" class="w-full max-w-sm p-6 bg-white rounded-xl shadow-md">
+    <h2 class="text-2xl font-bold text-center mb-4">Join ChatSecure</h2>
+    <input id="username" type="text" placeholder="Your Name" class="w-full mb-3 p-2 border rounded">
+    <input id="room" type="text" placeholder="Room Name" class="w-full mb-3 p-2 border rounded">
+    <button onclick="joinChat()" class="w-full bg-blue-500 hover:bg-blue-600 text-white p-2 rounded">Join Chat</button>
+  </div>
+
+  <!-- Chat Area -->
+  <div id="chatArea" class="hidden w-full max-w-2xl p-6 bg-white rounded-xl shadow-md flex flex-col h-[80vh]">
+    <div class="flex justify-between mb-2">
+      <h3 class="font-semibold">Chat Room</h3>
+      <div class="text-sm text-gray-600">🟢 Online: <span id="onlineUsers">0</span></div>
+    </div>
+    <ul id="userList" class="mb-2 text-sm text-gray-700 list-disc pl-5"></ul>
+
+    <div id="chatBox" class="flex-1 overflow-y-auto mb-4 p-2 border rounded bg-gray-50"></div>
+    <p id="typing" class="text-sm text-gray-500 h-5"></p>
+
+    <div class="flex gap-2">
+      <input id="msgInput" type="text" placeholder="Type your message..." class="flex-1 p-2 border rounded" oninput="sendTyping()" onkeydown="checkEnter(event)">
+      <button onclick="sendMessage()" class="bg-green-500 hover:bg-green-600 text-white p-2 px-4 rounded">Send</button>
+    </div>
+
+    <div class="flex gap-2 mt-2">
+      <input type="file" id="fileInput" class="flex-1 border rounded p-1 text-sm">
+      <button onclick="uploadFile()" class="bg-purple-500 text-white p-2 rounded">📎 Send File</button>
+    </div>
+  </div>
+
+  <!-- JavaScript -->
+  <script>
+    const socket = io();
+    let username = '';
+    let room = '';
+    let aesKey = null;
+    let currentRoom = '';
+
+    async function joinChat() {
+      username = document.getElementById('username').value.trim();
+      room = document.getElementById('room').value.trim();
+      if (!username || !room) return alert('Fill both fields');
+
+      const pwd = prompt('Enter shared password for encryption:');
+      if (!pwd) return alert('Encryption password is required');
+      aesKey = await generateKey(pwd);
+
+      document.getElementById('joinArea').classList.add('hidden');
+      document.getElementById('chatArea').classList.remove('hidden');
+      currentRoom = room;
+
+      socket.emit('join', { username, room });
+    }
+
+    async function sendMessage() {
+      const input = document.getElementById('msgInput');
+      const message = input.value.trim();
+      if (!message) return;
+      const encrypted = await encryptMessage(message);
+      socket.emit('send_message', { room, message: encrypted, username });
+      input.value = '';
+    }
+
+    function checkEnter(e) {
+      if (e.key === 'Enter') sendMessage();
+    }
+
+    function sendTyping() {
+      socket.emit('typing', { room });
+    }
+
+    async function uploadFile() {
+      const fileInput = document.getElementById('fileInput');
+      if (!fileInput.files.length) return alert('Choose a file');
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+
+      const res = await fetch('/upload', { method: 'POST', body: formData });
+      const data = await res.json();
+      const url = data.url;
+
+      const encrypted = await encryptMessage(`[FILE]${url}`);
+      socket.emit('send_message', { room, message: encrypted, username });
+      fileInput.value = '';
+    }
+
+    socket.on('receive_message', async data => {
+      const chatBox = document.getElementById('chatBox');
+      try {
+        const decrypted = await decryptMessage(data.message);
+        const msg = document.createElement('div');
+        msg.className = 'mb-1 message-wrapper';
+        msg.setAttribute('data-id', data.id);
+
+        if (decrypted.startsWith('[FILE]')) {
+          const url = decrypted.replace('[FILE]', '');
+          if (url.match(/\.(jpg|jpeg|png|gif)$/i)) {
+            msg.innerHTML = `<strong>${data.username}:</strong><br><img src="${url}" class="max-w-xs rounded">`;
+          } else {
+            msg.innerHTML = `<strong>${data.username}:</strong> <a href="${url}" target="_blank" class="text-blue-600 underline">Download File</a>`;
+          }
+        } else {
+          msg.innerHTML = `
+            <div class="group relative p-2 hover:bg-gray-100 rounded">
+              <strong>${data.username}:</strong> <span class="msg-content">${decrypted}</span>
+              <div class="absolute right-2 top-1 hidden group-hover:flex gap-1 text-xs">
+                <button onclick="editMessage(this, '${decrypted}', '${data.id}')" class="text-yellow-500 hover:underline">Edit</button>
+                <button onclick="deleteMessage('${data.id}')" class="text-red-500 hover:underline">Delete</button>
+              </div>
+            </div>`;
+        }
+
+        chatBox.appendChild(msg);
+        chatBox.scrollTop = chatBox.scrollHeight;
+      } catch {
+        appendMessage(`${data.username}: 🔒 Encrypted message (wrong key?)`, true);
+      }
+    });
+
+    socket.on('message_deleted', function(data) {
+      const msg = document.querySelector(`[data-id="${data.id}"]`);
+      if (msg) {
+        msg.innerHTML = `<em class="text-gray-400 text-sm">Message deleted</em>`;
+      }
+    });
+
+    socket.on('user_joined', user => appendNote(`${user} joined the chat`));
+    socket.on('user_left', user => appendNote(`${user} left the chat`));
+    socket.on('user_typing', user => {
+      const typing = document.getElementById('typing');
+      typing.textContent = `${user} is typing...`;
+      setTimeout(() => typing.textContent = '', 1500);
+    });
+    socket.on('update_users', users => {
+      const list = document.getElementById('userList');
+      list.innerHTML = '';
+      users.forEach(user => {
+        const li = document.createElement('li');
+        li.textContent = user;
+        list.appendChild(li);
+      });
+      document.getElementById('onlineUsers').textContent = users.length;
+    });
+
+    function appendMessage(text, error = false) {
+      const chatBox = document.getElementById('chatBox');
+      const msg = document.createElement('div');
+      msg.className = error ? 'text-red-500 text-sm' : '';
+      msg.textContent = text;
+      chatBox.appendChild(msg);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    function appendNote(note) {
+      const chatBox = document.getElementById('chatBox');
+      const noteDiv = document.createElement('div');
+      noteDiv.className = 'text-gray-500 text-sm';
+      noteDiv.textContent = note;
+      chatBox.appendChild(noteDiv);
+    }
+
+    // AES ENCRYPTION
+    async function generateKey(password) {
+      const enc = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), { name: 'PBKDF2' }, false, ['deriveKey']);
+      return crypto.subtle.deriveKey(
+        {
+          name: 'PBKDF2',
+          salt: enc.encode('chatsecure_salt'),
+          iterations: 100000,
+          hash: 'SHA-256'
+        },
+        keyMaterial,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    }
+
+    async function encryptMessage(text) {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const enc = new TextEncoder().encode(text);
+      const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, enc);
+      return JSON.stringify({ iv: Array.from(iv), data: Array.from(new Uint8Array(cipher)) });
+    }
+
+    async function decryptMessage(payload) {
+      const parsed = JSON.parse(payload);
+      const iv = new Uint8Array(parsed.iv);
+      const data = new Uint8Array(parsed.data);
+      const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, data);
+      return new TextDecoder().decode(plain);
+    }
+
+    function deleteMessage(id) {
+      const confirmDelete = confirm("Delete this message?");
+      if (!confirmDelete) return;
+      socket.emit('delete_message', { id: id, room: currentRoom });
+    }
+
+    function editMessage(button, oldMessage, id) {
+      const newText = prompt("Edit your message:", oldMessage);
+      if (!newText) return;
+      socket.emit('edit_message', { id, newText, room: currentRoom });
+    }
+
+    socket.on('message_edited', function(data) {
+      const msg = document.querySelector(`[data-id="${data.id}"] .msg-content`);
+      if (msg) {
+        msg.innerHTML = `${data.newText} <em class='text-xs text-gray-400'>(edited)</em>`;
+      }
+    });
+  </script>
+</body>
+</html>
